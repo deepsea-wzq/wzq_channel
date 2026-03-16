@@ -1,0 +1,9 @@
+{
+  "id": "wzq-channel",
+  "channels": ["wzq-channel"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
