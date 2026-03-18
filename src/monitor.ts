@@ -290,7 +290,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
     logger.info?.(`[${account.accountId}] 正在连接 WebSocket: ${account.wsUrl}`);
 
     try {
-      const reqUrl = account.wsUrl + "?" + account.token
+      const reqUrl = account.wsUrl + "?conntoken=" + account.token
       console.log("wzq websocket url: " + reqUrl)
       ws = new WebSocket(reqUrl, {
         headers: account.token ? { Authorization: `Bearer ${account.token}` } : {},
