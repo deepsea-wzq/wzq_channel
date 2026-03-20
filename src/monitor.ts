@@ -324,6 +324,8 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
         pongTimeoutTimer = null;
       }
       waitingForPong = false;
+      // 通知 gateway 健康监控：连接仍然活跃
+      statusSink({ lastEventAt: Date.now() });
     });
 
     ws.on("message", async (data) => {
@@ -335,7 +337,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           direction: "inbound",
           at: Date.now(),
         });
-        statusSink({ lastInboundAt: Date.now() });
+        statusSink({ lastInboundAt: Date.now(), lastEventAt: Date.now() });
 
         // 解析服务器推送的消息
         // 期望格式：{session_id,content_type,content}
