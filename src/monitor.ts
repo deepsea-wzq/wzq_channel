@@ -85,7 +85,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
   // ── 心跳保活 ──────────────────────────────────────────────────────────────
   // 每隔 HEARTBEAT_INTERVAL 毫秒发送一次 ping；
   // 若在 HEARTBEAT_TIMEOUT 毫秒内未收到 pong，则主动关闭连接触发重连。
-  const HEARTBEAT_INTERVAL = 30_000; // 30 秒发一次 ping
+  const HEARTBEAT_INTERVAL = 10_000; // 10 秒发一次 ping
   const HEARTBEAT_TIMEOUT  = 10_000; // 10 秒内必须收到 pong
 
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
