@@ -121,7 +121,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
       }
       waitingForPong = true;
       socket.ping();
-      console.log('socket send pin')
+      // console.log('socket send pin')
       // 启动 pong 超时计时器
       pongTimeoutTimer = setTimeout(() => {
         if (waitingForPong) {
@@ -318,7 +318,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
 
     ws.on("pong", () => {
       // 收到服务器 pong，清除超时计时器，标记已响应
-      console.log("socket get pong")
+      // console.log("socket get pong")
       if (pongTimeoutTimer !== null) {
         clearTimeout(pongTimeoutTimer);
         pongTimeoutTimer = null;
