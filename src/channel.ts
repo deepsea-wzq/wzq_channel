@@ -193,12 +193,13 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
       return { ok: true, to: "default" };
     },
     sendText: async ({ cfg, to, text, accountId }) => {
-      console.log("sendText")
+      console.log("sendText", text)
       const account = resolveMyWsAccount(cfg, accountId);
       const result = await sendMyWsMessage({
         accountId: account.accountId,
         to,
         text,
+        reply_id: "system",
       });
       return {
         channel: "wzq-channel",

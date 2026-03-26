@@ -5,6 +5,7 @@ export type SendMyWsMessageOptions = {
   accountId: string;
   to: string;
   text: string;
+  reply_id?: string;
 };
 
 export type SendMyWsMessageResult = {
@@ -19,7 +20,7 @@ export type SendMyWsMessageResult = {
 export async function sendMyWsMessage(
   opts: SendMyWsMessageOptions,
 ): Promise<SendMyWsMessageResult> {
-  const { accountId, to, text } = opts;
+  const { accountId, to, text, reply_id } = opts;
   const ws = getActiveWs(accountId);
 
   if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */) {
@@ -34,6 +35,7 @@ export async function sendMyWsMessage(
     JSON.stringify({
       content_type: "text",
       content: text,
+      reply_id: reply_id,
     }),
   );
 
@@ -57,7 +59,7 @@ export async function sendMyWsMessage(
 export async function sendProcessing(
   opts: SendMyWsMessageOptions,
 ): Promise<SendMyWsMessageResult> {
-  const { accountId, to, text } = opts;
+  const { accountId, to, text, reply_id } = opts;
   const ws = getActiveWs(accountId);
 
   if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */) {
@@ -71,7 +73,66 @@ export async function sendProcessing(
   ws.send(
     JSON.stringify({
       content_type: "processing",
-      content: text
+      content: text,
+      reply_id: reply_id,
+    }),
+  );
+  return { messageId, chatId: to };
+}
+
+
+/**
+ * 通过已建立的 WebSocket 连接发送出站消息。
+ * 可根据实际服务器协议调整此处的序列化格式。
+ */
+export async function sendDone(
+  opts: SendMyWsMessageOptions,
+): Promise<SendMyWsMessageResult> {
+  const { accountId, to, text, reply_id } = opts;
+  const ws = getActiveWs(accountId);
+
+  if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */) {
+    throw new Error(
+      `[wzq-channel] 账户 "${accountId}" 的 WebSocket 连接未就绪（readyState=${ws?.readyState ?? "无连接"}）`,
+    );
+  }
+
+  const messageId = `ws-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  ws.send(
+    JSON.stringify({
+      content_type: "done",
+      content: text,
+      reply_id: reply_id,
+    }),
+  );
+  return { messageId, chatId: to };
+}
+
+
+/**
+ * 通过已建立的 WebSocket 连接发送 control 类型消息。
+ */
+export async function sendControl(
+  opts: SendMyWsMessageOptions,
+): Promise<SendMyWsMessageResult> {
+  const { accountId, to, text, reply_id } = opts;
+  const ws = getActiveWs(accountId);
+
+  if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */) {
+    throw new Error(
+      `[wzq-channel] 账户 "${accountId}" 的 WebSocket 连接未就绪（readyState=${ws?.readyState ?? "无连接"}）`,
+    );
+  }
+
+  const messageId = `ws-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const effectiveReplyId = reply_id || "123456";
+
+  ws.send(
+    JSON.stringify({
+      content_type: "control",
+      content: text,
+      reply_id: effectiveReplyId,
     }),
   );
   return { messageId, chatId: to };

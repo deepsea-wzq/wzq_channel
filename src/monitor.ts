@@ -3,13 +3,57 @@ import { buildAgentMediaPayload } from "openclaw/plugin-sdk";
 import WebSocket from "ws";
 import type { ResolvedMyWsAccount } from "./accounts.js";
 import { getMyWsRuntime } from "./runtime.js";
-import {sendMyWsMessage, sendProcessing} from "./send";
+import {sendMyWsMessage, sendProcessing, sendDone, sendControl} from "./send";
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-let isConn = false
+
+/**
+ * 简单的异步串行队列：确保同一时间只处理一个任务，
+ * 后续任务排队等待，按入队顺序依次执行。
+ */
+class AsyncQueue {
+  private queue: (() => Promise<void>)[] = [];
+  private running = false;
+
+  enqueue(task: () => Promise<void>) {
+    this.queue.push(task);
+    if (!this.running) {
+      this.run();
+    }
+  }
+
+  /** 清空队列中所有待执行的任务（不影响正在执行的任务） */
+  clear(): number {
+    const count = this.queue.length;
+    this.queue = [];
+    return count;
+  }
+
+  private async run() {
+    this.running = true;
+    while (this.queue.length > 0) {
+      const task = this.queue.shift()!;
+      try {
+        await task();
+      } catch (err) {
+        console.error("[AsyncQueue] 任务执行异常:", err);
+      }
+    }
+    this.running = false;
+  }
+}
+
+/** 消息处理串行队列 */
+const messageQueue = new AsyncQueue();
+
+/**
+ * 每个消息维护一个 AbortController（key 为消息 id），
+ * 前端通过 control 命令 { method: "chat.stop" } 来停止当前生成并清空队列。
+ */
+const messageAbortControllers = new Map<string, AbortController>();
 
 /**
  * 活跃的 WebSocket 连接表，key 为 accountId
@@ -65,18 +109,14 @@ function imageToDataURL(filePath) {
  */
 export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: () => void }> {
 
-  if (isConn) {
-    console.log("只创建一个链接")
-    return
-  }
-  console.log("正在启动 WebSocket 连接")
-
   const { account, runtime, abortSignal, statusSink, cfg } = opts;
   const core = getMyWsRuntime();
   const logger = core.logging.getChildLogger({
     channel: "wzq-channel",
     accountId: account.accountId,
   });
+
+  logger.info?.("正在启动 WebSocket 连接");
 
   let stopped = false;
   let ws: WebSocket | null = null;
@@ -328,7 +368,92 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
       statusSink({ lastEventAt: Date.now() });
     });
 
-    ws.on("message", async (data) => {
+    ws.on("message", (data) => {
+      // ── 先解析消息，control 类型不排队，直接异步处理 ──────────────
+      let msg: {
+        session_id?: string;
+        content_type?: string;
+        content?: string;
+        id?: string;
+      };
+      try {
+        msg = JSON.parse(String(data));
+      } catch {
+        logger.warn?.(`[${account.accountId}] 消息 JSON 解析失败，忽略`);
+        return;
+      }
+
+      const sid = msg.session_id ?? "unknown";
+      const mid = msg.id ?? "unknown";
+      const logTag = `[${account.accountId}][sid=${sid}][mid=${mid}]`;
+
+      // ── 处理 control 类型消息：不排队，立即执行 ─────────────────
+      if (msg.content_type === "control") {
+        (async () => {
+          let ctrl: { method?: string; params?: Record<string, any> } = {};
+          try {
+            ctrl = msg.content ? JSON.parse(msg.content) : {};
+          } catch {
+            logger.warn?.(`${logTag} [control] content 解析失败，忽略`);
+            return;
+          }
+          const { method, params = {} } = ctrl;
+          if (!method) {
+            logger.warn?.(`${logTag} [control] 缺少 method 字段，忽略`);
+            return;
+          }
+          logger.info?.(`${logTag} [control] 收到指令: ${method}`);
+
+          // ── chat.stop：停止当前生成 + 清空队列 ────────────────
+          if (method === "chat.stop") {
+            // abort 所有正在进行的消息
+            let abortedCount = 0;
+            for (const [id, controller] of messageAbortControllers) {
+              logger.info?.(`${logTag} [control] 正在停止消息 id=${id} 的生成`);
+              controller.abort();
+              abortedCount++;
+            }
+            // 清空队列，后续排队的任务也不再执行
+            const cleared = messageQueue.clear();
+            logger.info?.(`${logTag} [control] chat.stop: 已中止 ${abortedCount} 个任务, 清空队列 ${cleared} 个待执行任务`);
+            await sendControl({
+              accountId: account.accountId,
+              to: `wzq-channel:${sid}`,
+              reply_id: mid,
+              text: JSON.stringify({ method, data: { stopped: true, abortedCount, clearedQueue: cleared } }),
+            });
+            return;
+          }
+
+          // ── 其他 control 方法：转发到 gateway ────────────────────
+          try {
+            const payload = await callGateway(method, params);
+            logger.info?.(`${logTag} [control] ${method} 调用成功`);
+            await sendControl({
+              accountId: account.accountId,
+              to: msg.session_id ?? "",
+              reply_id: mid,
+              text: JSON.stringify({ method, data: payload }),
+            });
+          } catch (err) {
+            logger.error(`${logTag} [control] ${method} 调用失败: ${String(err)}`);
+            await sendControl({
+              accountId: account.accountId,
+              to: msg.session_id ?? "",
+              reply_id: mid,
+              text: JSON.stringify({ method, error: String(err) }),
+            });
+          }
+        })();
+        return;
+      }
+
+      // ── 非 control 消息：进入串行队列 ──────────────────────────
+      messageQueue.enqueue(async () => {
+      // 注册本消息的 AbortController，前端可通过 chat.stop 中断
+      const currentAbort = new AbortController();
+      messageAbortControllers.set(mid, currentAbort);
+
       try {
         // 记录入站活动
         core.channel.activity.record({
@@ -339,52 +464,6 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
         });
         statusSink({ lastInboundAt: Date.now(), lastEventAt: Date.now() });
 
-        // 解析服务器推送的消息
-        // 期望格式：{session_id,content_type,content}
-        // 可根据实际服务器协议调整此处的字段映射
-        const msg = JSON.parse(String(data)) as {
-          session_id?: string;
-          content_type?: string;
-          content?: string;
-        };
-
-        // ── 处理 control 类型消息：通用 gateway RPC 透传 ─────────────────
-        // content 为序列化的 JSON: { method: "cron.list", params: { ... } }
-        // method 直接对应 gateway RPC 方法名，params 直接透传给 gateway
-        if (msg.content_type === "control") {
-          let ctrl: { method?: string; params?: Record<string, any> } = {};
-          try {
-            ctrl = msg.content ? JSON.parse(msg.content) : {};
-          } catch {
-            console.warn("[control] content 解析失败，忽略");
-            return;
-          }
-          const { method, params = {} } = ctrl;
-          if (!method) {
-            console.warn("[control] 缺少 method 字段，忽略");
-            return;
-          }
-          console.log(`[control] 收到 gateway 调用: ${method}`);
-
-          try {
-            const payload = await callGateway(method, params);
-            console.log(`[control] ${method} 调用成功`);
-            ws?.send(JSON.stringify({
-              content_type: "control",
-              content: JSON.stringify({ method, data: payload }),
-              session_id: msg.session_id,
-            }));
-          } catch (err) {
-            console.error(`[control] ${method} 调用失败: ${err}`);
-            ws?.send(JSON.stringify({
-              content_type: "control",
-              content: JSON.stringify({ method, error: String(err) }),
-              session_id: msg.session_id,
-            }));
-          }
-          return;
-        }
-
         if (!msg.session_id) {
           logger.warn?.(`[${account.accountId}] 收到格式不符的消息，已忽略: ${String(data)}`);
           return;
@@ -394,22 +473,21 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           logger.warn?.(`[${account.accountId}] 收到格式不符的消息，已忽略: ${String(data)}`);
           return;
         }
-
-        console.log("send message" + msg.content);
+        logger.info?.(`${logTag} 收到消息, content=${msg.content}`);
         // 处理图片媒体（参考飞书插件 bot.ts 的标准做法）
         // 使用 core.channel.media.saveMediaBuffer 保存到 openclaw 允许的目录
         const mediaList: Array<{ path: string; contentType: string; placeholder: string }> = [];
         if (msg.content.indexOf("image") !== -1) {
           const tmpMsgList = JSON.parse(msg.content)
-          console.log(tmpMsgList);
+          logger.info?.(`${logTag} 解析到图片列表`);
           let newTmpMsgList: any[] = [];
           for (const item of tmpMsgList) {
             if (item.type == 'image') {
-              console.log("image")
+              logger.info?.(`${logTag} 处理图片, image_id=${item.image_id}`);
               const baseUrl = account.fileUrl + "?token=" + account.token + "&image_id="
               const imageId = item.image_id;
               const imageUrl = baseUrl + imageId;
-              console.log("请求路径是" + imageUrl)
+              logger.debug?.(`${logTag} 图片下载地址: ${imageUrl}`);
               try {
                 // 下载图片到内存（Buffer）
                 const response = await axios({
@@ -419,7 +497,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                 });
                 const buffer = Buffer.from(response.data);
                 const contentType = response.headers['content-type'] || 'image/jpeg';
-                console.log(`图片下载成功, size=${buffer.length}, contentType=${contentType}`);
+                logger.info?.(`${logTag} 图片下载成功, size=${buffer.length}, contentType=${contentType}`);
 
                 // 使用 openclaw 核心 API 保存到允许的目录
                 const saved = await core.channel.media.saveMediaBuffer(
@@ -428,7 +506,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                   "inbound",
                   30 * 1024 * 1024, // 30MB max
                 );
-                console.log(`图片已保存到 openclaw 媒体目录: ${saved.path}`);
+                logger.info?.(`${logTag} 图片已保存到 openclaw 媒体目录: ${saved.path}`);
 
                 mediaList.push({
                   path: saved.path,
@@ -436,15 +514,14 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                   placeholder: "<media:image>",
                 });
               } catch (err) {
-                console.error(`下载/保存图片失败: ${err}`);
+                logger.error(`${logTag} 下载/保存图片失败: ${String(err)}`);
               }
             } else {
               newTmpMsgList.push(item);
             }
           }
-          console.log("替换完以后得数据")
-          console.log(newTmpMsgList);
-          console.log("mediaList:", mediaList);
+          logger.debug?.(`${logTag} 图片替换完成, newMsgList=${JSON.stringify(newTmpMsgList)}`);
+          logger.debug?.(`${logTag} mediaList: ${JSON.stringify(mediaList)}`);
           msg.content = JSON.stringify(newTmpMsgList);
         }
 
@@ -493,20 +570,59 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           ...mediaPayload,
         });
 
-        console.log('结构完成')
+        logger.info?.(`${logTag} 入站上下文构建完成`);
 
         try {
           const messagesConfig = core.channel.reply.resolveEffectiveMessagesConfig(
             cfg,
             route.agentId,
           );
-          console.log("执行ai调用")
+          logger.info?.(`${logTag} 开始 AI 调用`);
+
+          // 如果在开始 AI 调用前就已被 abort，直接跳过
+          if (currentAbort.signal.aborted) {
+            logger.info?.(`${logTag} AI 调用前已被 abort，跳过`);
+            return;
+          }
+
           // 发送思考中状态
           await sendProcessing({
             accountId: account.accountId,
             to: address,
             text: "思考中",
+            reply_id: mid,
           })
+
+          let deliverCount = 0;
+          let lastDeliverTime = Date.now();
+          const dispatchStartTime = lastDeliverTime;
+
+          // 监听 abort 信号，通过 gateway chat.abort 中止底层 LLM 请求
+          const onAbort = async () => {
+            try {
+              logger.info?.(`${logTag} 正在通过 gateway chat.abort 中止 AI 生成`);
+              await callGateway("chat.abort", { sessionKey: route.sessionKey });
+              logger.info?.(`${logTag} gateway chat.abort 调用成功`);
+            } catch (err) {
+              logger.warn?.(`${logTag} gateway chat.abort 调用失败: ${String(err)}`);
+            }
+          };
+
+          // 如果已被 abort，给前端发送一条信息，成功结束
+          if (currentAbort.signal.aborted) {
+            logger.info?.(`${logTag} 任务开始前已被 abort，跳过 AI 调用`);
+            await onAbort();
+            await sendDone({
+              accountId: account.accountId,
+              to: address,
+              text: "已停止",
+              reply_id: mid,
+            });
+            return;
+          }
+
+          currentAbort.signal.addEventListener("abort", () => { onAbort(); }, { once: true });
+
           await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg,
@@ -517,37 +633,66 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                 payload: { text?: string; mediaUrl?: string; mediaUrls?: string[] },
                 _info?: { kind?: string },
               ) => {
-                console.log("ai调用回复")
+                // 如果已被 abort，不再发送后续消息
+                if (currentAbort.signal.aborted) {
+                  logger.info?.(`${logTag} deliver 被跳过（已 abort）`);
+                  return;
+                }
+
+                deliverCount++;
+                const now = Date.now();
+                const interval = now - lastDeliverTime;
+                lastDeliverTime = now;
+
+                logger.info?.(`${logTag} deliver #${deliverCount}, 距上次=${interval}ms`);
 
                 const text = payload.text ?? "";
 
-                console.log(JSON.stringify(payload))
+                logger.debug?.(`${logTag} deliver payload: ${JSON.stringify(payload)}`);
 
                 // 发送信息
                 const result = await sendMyWsMessage({
                   accountId: account.accountId,
                   to: address,
                   text: text,
+                  reply_id: mid,
                 });
-                console.log("发送信息返回结果是")
-                console.log(result)
+                logger.info?.(`${logTag} 消息发送完成, result=${JSON.stringify(result)}`);
               },
               onError: (err: unknown) => {
-                console.log("AI dispatch onerror")
-                console.log(err)
+                logger.error(`${logTag} AI dispatch 错误: ${String(err)}`);
               },
             },
             replyOptions: {},
           });
-          console.log("整段代码执行完毕")
+          const totalTime = Date.now() - dispatchStartTime;
+          if (currentAbort.signal.aborted) {
+            logger.info?.(`${logTag} AI 回复被中断, 共 ${deliverCount} 次 deliver, 总耗时=${totalTime}ms`);
+          } else {
+            logger.info?.(`${logTag} AI 回复全部发送完毕, 共 ${deliverCount} 次 deliver, 总耗时=${totalTime}ms`);
+          }
         } catch (err) {
-          console.log('catech exception')
-          console.log(err)
+          if (currentAbort.signal.aborted) {
+            logger.info?.(`${logTag} AI 调用被中止（前端发送了 chat.stop）`);
+          } else {
+            logger.error(`${logTag} AI 调用异常: ${String(err)}`);
+          }
         }
+        // 发送完成状态（abort 时发 "已停止"，正常完成发 "结束"）
+        await sendDone({
+          accountId: account.accountId,
+          to: address,
+          text: currentAbort.signal.aborted ? "已停止" : "结束",
+          reply_id: mid,
+        })
       } catch (err) {
         logger.error(`[${account.accountId}] 处理入站消息失败: ${String(err)}`);
         statusSink({ lastError: String(err) });
+      } finally {
+        // 无论成功失败，清理当前消息的 AbortController
+        messageAbortControllers.delete(mid);
       }
+      }); // messageQueue.enqueue end
     });
 
     ws.on("error", (err) => {

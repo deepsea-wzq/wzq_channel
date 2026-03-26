@@ -57,6 +57,41 @@
         }
     }
 }
+
+"models": {
+    "providers": {
+      "claude": {
+        "baseUrl": "",
+        "apiKey": "",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude-Sonnet-4-6",
+            "input": ["text", "image"]   // 配置支持图片
+          }
+        ]  
+      }
+    }
+}
 ```
 3. outbound的resolveTarget控制，消息通知投送给谁，先设置成default
+4. gateway会定时检测健康度，pong时上报下，不然会重调钩子StartAccount函数
+```
+// 通知 gateway 健康监控：连接仍然活跃
+statusSink({ lastEventAt: Date.now() });
+```
+5. 目前使用流式，如果openclaw.json不指定如下配置，会等所有回复聚合发送
+```
+{
+  "agents": {
+    "defaults": {
+      "blockStreamingDefault": "on",
+      "blockStreamingChunk": {
+        "breakPreference": "sentence"
+      }
+    }
+  }
+}
+```
 
