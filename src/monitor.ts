@@ -722,9 +722,28 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
         }
 
         // 使用 buildAgentMediaPayload 构建标准媒体字段（兼容旧版 SDK）
-        const mediaPayload = typeof buildAgentMediaPayload === "function"
-          ? buildAgentMediaPayload(mediaList)
-          : {};
+        logger.info?.(`${logTag} buildAgentMediaPayload available=${typeof buildAgentMediaPayload === "function"}`);
+        let mediaPayload: Record<string, any> = {};
+        if (typeof buildAgentMediaPayload === "function") {
+          mediaPayload = buildAgentMediaPayload(mediaList);
+        } else if (mediaList.length > 0) {
+          // fallback：手动构建 MediaPath / MediaPaths / MediaType（兼容 SDK 版本不导出 buildAgentMediaPayload 的情况）
+          logger.info?.(`${logTag} 使用 fallback 手动构建 mediaPayload`);
+          const firstMedia = mediaList[0];
+          mediaPayload.MediaPath = firstMedia.path;
+          mediaPayload.MediaType = firstMedia.contentType?.startsWith("image") ? "image"
+            : firstMedia.contentType?.startsWith("audio") ? "audio"
+            : firstMedia.contentType?.startsWith("video") ? "video"
+            : "file";
+          if (mediaList.length > 1) {
+            mediaPayload.MediaPaths = mediaList.map((m: any) => ({
+              path: m.path,
+              contentType: m.contentType,
+              placeholder: m.placeholder,
+            }));
+          }
+        }
+        logger.info?.(`${logTag} mediaPayload=${JSON.stringify(mediaPayload)}`);
 
         const session_id = msg.session_id // Date.now().toString()
         const route = core.channel.routing.resolveAgentRoute({
@@ -768,7 +787,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           ...mediaPayload,
         });
 
-        logger.info?.(`${logTag} 入站上下文构建完成`);
+        logger.info?.(`${logTag} 入站上下文构建完成, MediaPath=${ctxPayload.MediaPath}, MediaPaths=${JSON.stringify(ctxPayload.MediaPaths)}, MediaType=${ctxPayload.MediaType}`);
 
         try {
           const messagesConfig = core.channel.reply.resolveEffectiveMessagesConfig(
